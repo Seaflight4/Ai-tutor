@@ -4,9 +4,9 @@ Flow:
   start_session(image)
       -> OCR -> parse -> persist session -> opening question -> persist turn
   reply(session_id, student_message)
-      -> persist student turn -> diagnose -> generate hint (level 1..3)
-      -> if loop_count >= MAX_HINT_LOOPS: offer reveal instead of a 4th hint
-      -> persist tutor turn -> update loop_count
+      -> persist student turn -> assess_and_respond (diagnose + hint in one call)
+      -> if wants_solution: reveal full solution
+      -> else persist tutor turn -> update loop_count
       -> if resolved: update profiles
   reveal(session_id)
       -> generate full solution -> persist -> mark resolved
@@ -14,7 +14,7 @@ Flow:
 
 from __future__ import annotations
 
-import contextlib
+import logging
 from typing import Any
 from uuid import UUID
 
@@ -24,7 +24,9 @@ from app.models.schemas import (
     ResolutionType,
     TutorReply,
 )
-from app.services import diagnosis, hints, ocr, profile, solution
+from app.services import hints, ocr, profile, solution, tutor
+
+logger = logging.getLogger(__name__)
 
 
 async def start_session(
@@ -66,7 +68,13 @@ async def start_session(
 
 
 async def reply(session_id: UUID, student_message: str) -> TutorReply:
-    """Process a student reply and produce the tutor's next hint / offer."""
+    """Process a student reply and produce the tutor's next hint or a reveal.
+
+    The loop runs continuously — there is no forced reveal offer after N hints.
+    The session reveals the full solution only when the student explicitly
+    requests it, either via a conservative keyword heuristic (saves an LLM
+    call on obvious requests) or via the diagnosis `wants_solution` flag.
+    """
     session = supabase.get_session(session_id)
     problem_text = session["problem_text"]
     concepts = session["concepts"] or []
@@ -83,8 +91,8 @@ async def reply(session_id: UUID, student_message: str) -> TutorReply:
         loop_index=loop_count + 1,
     )
 
-    # Check for reveal choice after an offer was made.
-    if _is_reveal_choice(student_message) and loop_count >= config.get_settings().max_hint_loops:
+    # 1. Obvious explicit solution request -> reveal immediately (skip diagnosis).
+    if _is_solution_request(student_message):
         out = await _do_reveal(session_id, problem_text, concepts, dialogue)
         return TutorReply(
             session_id=session_id,
@@ -98,29 +106,29 @@ async def reply(session_id: UUID, student_message: str) -> TutorReply:
             solution=out["solution"],
         )
 
-    diag = await diagnosis.diagnose(
+    # 2. Diagnose + respond in a single LLM call (coherent reasoning pass).
+    diag, hint = await tutor.assess_and_respond(
         problem_text, concepts, dialogue, student_message, loop_count
     )
 
-    new_loop = loop_count + 1
-    max_loops = config.get_settings().max_hint_loops
-
-    if new_loop >= max_loops:
-        # Offer the reveal choice instead of going deeper.
-        content = _REVEAL_OFFER
-        hint_level = None
-        offer_reveal = True
-    else:
-        content = await hints.generate_hint(
-            problem_text,
-            concepts,
-            dialogue,
-            diag.classification,
-            diag.target_concept,
-            diag.next_hint_level,
+    if diag.wants_solution:
+        out = await _do_reveal(session_id, problem_text, concepts, dialogue)
+        return TutorReply(
+            session_id=session_id,
+            content=out["solution"],
+            loop_index=out["loop_index"],
+            hint_level=None,
+            classification=None,
+            offer_reveal=False,
+            resolved=True,
+            resolution_type=ResolutionType.revealed,
+            solution=out["solution"],
         )
-        hint_level = diag.next_hint_level
-        offer_reveal = False
+
+    # 3. Otherwise emit the structured hint; the loop continues indefinitely.
+    new_loop = loop_count + 1
+    content = hints.summarize_hint(hint, diag.classification)
+    hint_level = None
 
     supabase.add_turn(
         session_id,
@@ -132,6 +140,7 @@ async def reply(session_id: UUID, student_message: str) -> TutorReply:
         metadata={
             "reasoning": diag.reasoning,
             "target_concept": diag.target_concept,
+            "hint": hint.model_dump(),
         },
     )
     supabase.update_session(session_id, loop_count=new_loop)
@@ -142,8 +151,9 @@ async def reply(session_id: UUID, student_message: str) -> TutorReply:
         loop_index=new_loop,
         hint_level=hint_level,
         classification=diag.classification,
-        offer_reveal=offer_reveal,
+        offer_reveal=False,
         resolved=False,
+        hint=hint,
     )
 
 
@@ -161,15 +171,6 @@ async def reveal_solution(session_id: UUID) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # internals
 # ---------------------------------------------------------------------------
-_REVEAL_OFFER = (
-    "It looks like we've explored this from a few angles and it's still tricky. "
-    "Would you like to:\n"
-    "  (a) try one more hint, or\n"
-    "  (b) walk through the full solution together?\n"
-    "Just reply 'a' or 'b'."
-)
-
-
 def _render_dialogue(turns: list[dict[str, Any]]) -> str:
     lines = []
     for t in turns:
@@ -178,8 +179,59 @@ def _render_dialogue(turns: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _is_reveal_choice(message: str) -> bool:
-    return message.strip().lower() in {"b", "(b)", "reveal", "solution", "yes"}
+# Phrases that count as an explicit request to reveal the full solution.
+# Conservative: a normal stuck reply or a sub-question ("what's the answer to
+# part a?") must NOT match. Used as a fast path before diagnosis; the LLM's
+# `wants_solution` flag catches the softer cases.
+_SOLUTION_REQUESTS = {
+    "show me the solution",
+    "show me the full solution",
+    "show solution",
+    "show the solution",
+    "reveal the solution",
+    "reveal solution",
+    "give me the solution",
+    "give me the answer",
+    "just tell me the answer",
+    "tell me the answer",
+    "i give up",
+    "i want the solution",
+    "i want the answer",
+    "solve it",
+    "solve it for me",
+    "walk me through the solution",
+    "show me how to solve it",
+    "show me how to solve this",
+    "can you solve it",
+    "solve this for me",
+}
+
+# Substring needles for requests that tolerate filler words ("full", "please",
+# "can you", "how to", "this/it"). Order: longer/odd phrases first so we match
+# the most specific intent.
+_SOLUTION_NEEDLES = (
+    "show me the solution",
+    "show me the full solution",
+    "show me how to solve",
+    "show the solution",
+    "give me the solution",
+    "give me the answer",
+    "give me the full solution",
+    "reveal the solution",
+    "walk me through the solution",
+    "solve it for me",
+    "solve this for me",
+    "can you solve",
+    "i give up",
+    "just tell me the answer",
+)
+
+
+def _is_solution_request(message: str) -> bool:
+    msg = message.strip().lower()
+    if msg in _SOLUTION_REQUESTS:
+        return True
+    return any(n in msg for n in _SOLUTION_NEEDLES)
 
 
 async def _do_reveal(
@@ -204,7 +256,7 @@ async def _do_reveal(
 
     # Update knowledge profiles for personalization.
     session_row = supabase.get_session(session_id)
-    with contextlib.suppress(Exception):
+    try:
         await profile.update_profiles(
             UUID(session_row["student_id"]),
             session_id,
@@ -213,6 +265,8 @@ async def _do_reveal(
             Classification.on_track,  # neutral; mastery estimated from dialogue
             dialogue,
         )
+    except Exception as exc:
+        logger.warning("profile update failed for session %s: %s", session_id, exc)
 
     return {
         "session_id": str(session_id),
@@ -224,12 +278,18 @@ async def _do_reveal(
 
 
 async def _maybe_upload_image(student_id: UUID, image_bytes: bytes, mime: str) -> str | None:
-    """Best-effort upload to Supabase Storage. Returns public URL or None."""
+    """Best-effort upload to Supabase Storage. Returns public URL or None.
+
+    Skipped entirely on the local backend (no storage configured).
+    """
+    if not config.get_settings().supabase_url:
+        return None
     try:
         client = supabase.get_client()
         bucket = config.get_settings().supabase_bucket
         path = f"{student_id}/{student_id}.png"
         client.storage.from_(bucket).upload(path, image_bytes, {"content-type": mime})
-        return client.storage.from_(bucket).get_public_url(path)
+        url: str = client.storage.from_(bucket).get_public_url(path)
+        return url
     except Exception:
         return None

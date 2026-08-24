@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
 from app.core.config import get_settings
@@ -23,13 +25,14 @@ app = FastAPI(
     ),
 )
 app.include_router(router, prefix="/api")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+
+@app.get("/")
+async def root() -> FileResponse:
+    return FileResponse("app/static/index.html")
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
-
-
-@app.get("/")
-async def root() -> dict[str, str]:
-    return {"service": "ai-tutor", "version": "0.1.0"}

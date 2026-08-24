@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from app.models.schemas import Classification
 from app.prompts import guided_discovery as p
 
 
@@ -22,22 +21,56 @@ def test_opening_user_without_weak_concepts():
     assert "weak mastery" not in msg
 
 
-def test_diagnosis_user_includes_loop():
-    msg = p.diagnosis_user("prob", ["c"], "TUTOR: hi\nSTUDENT: hi", "I'm stuck", 2)
+def test_tutor_user_includes_loop_and_reply():
+    msg = p.tutor_user("prob", ["c"], "TUTOR: hi\nSTUDENT: hi", "I'm stuck", 2)
     assert "Current hint loop: 2" in msg
+    assert "I'm stuck" in msg
 
 
-def test_hint_user_level_appears():
-    msg = p.hint_user(
-        "prob", ["c"], "dialogue", Classification.misapplication, "energy", 3
-    )
-    assert "Requested hint level: 3" in msg
-    assert "misapplication" in msg
+def test_tutor_system_mentions_all_diagnosis_fields():
+    for field in ("classification", "reasoning", "target_concept", "wants_solution"):
+        assert field in p.TUTOR_SYSTEM, f"TUTOR_SYSTEM must mention {field}"
 
 
-def test_reveal_offer_is_choice():
-    assert "(a)" in p.REVEAL_OFFER
-    assert "(b)" in p.REVEAL_OFFER
+def test_tutor_system_mentions_all_hint_fields():
+    for field in (
+        "formula",
+        "explanation",
+        "example",
+        "mistake",
+        "reason",
+        "application_hint",
+        "confirmation",
+        "next_step_hint",
+    ):
+        assert field in p.TUTOR_SYSTEM, f"TUTOR_SYSTEM must mention {field}"
+
+
+def test_tutor_system_branches_on_diagnosis():
+    assert "knowledge_gap" in p.TUTOR_SYSTEM
+    assert "misapplication" in p.TUTOR_SYSTEM
+    assert "on_track" in p.TUTOR_SYSTEM
+
+
+def test_tutor_system_forbids_solving():
+    assert "NEVER give the final answer" in p.TUTOR_SYSTEM
+    assert "ONLY what the student asked" in p.TUTOR_SYSTEM
+
+
+def test_tutor_system_asks_for_latex():
+    assert "LaTeX" in p.TUTOR_SYSTEM
+    assert "$" in p.TUTOR_SYSTEM
+
+
+def test_opening_system_three_parts():
+    # Opening must mandate greeting + problem-type summary + "where are you stuck".
+    assert "greeting" in p.OPENING_SYSTEM.lower()
+    assert "problem type" in p.OPENING_SYSTEM.lower()
+    assert "where" in p.OPENING_SYSTEM.lower() and "stuck" in p.OPENING_SYSTEM.lower()
+
+
+def test_solution_system_asks_for_latex():
+    assert "LaTeX" in p.SOLUTION_SYSTEM
 
 
 def test_solution_user_includes_problem_and_dialogue():

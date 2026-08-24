@@ -79,8 +79,28 @@ class ReplyIn(BaseModel):
     message: str
 
 
+class HintOutput(BaseModel):
+    """Structured hint returned to the student, scoped to the diagnosis.
+
+    For a knowledge_gap: fill `explanation` (definition), `formula`, `example`.
+    For a misapplication: fill `mistake`, `reason`, `application_hint`.
+    For on_track: fill `confirmation` (affirmation) + `next_step_hint` (small nudge).
+    Unused fields stay null.
+    """
+
+    formula: str | None = None
+    explanation: str | None = None
+    example: str | None = None
+    mistake: str | None = None
+    reason: str | None = None
+    application_hint: str | None = None
+    confirmation: str | None = None
+    next_step_hint: str | None = None
+
+
 class TutorReply(BaseModel):
     """What the API returns after a student replies."""
+
     session_id: UUID
     content: str
     loop_index: int
@@ -90,6 +110,7 @@ class TutorReply(BaseModel):
     resolved: bool = False
     resolution_type: ResolutionType | None = None
     solution: str | None = None
+    hint: HintOutput | None = None
 
 
 class RevealOut(BaseModel):
@@ -106,7 +127,7 @@ class Diagnosis(BaseModel):
     classification: Classification
     reasoning: str = ""
     target_concept: str | None = None
-    next_hint_level: int = 1  # 1..3
+    wants_solution: bool = False
 
 
 # ---------------------------------------------------------------------------

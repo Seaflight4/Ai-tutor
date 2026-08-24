@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Tutor — Physics</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"
+        crossorigin="anonymous" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"
+          crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+          crossorigin="anonymous"></script>
+</head>
+<body>
+  <header class="app-header">
+    <h1>AI Tutor — Physics</h1>
+    <div id="status" class="status" hidden></div>
+  </header>
+
+  <main class="layout">
+    <!-- Upload panel -->
+    <section class="panel upload-panel" id="upload-panel">
+      <h2>1. Upload a problem</h2>
+      <p class="hint">A printed (not handwritten) physics problem. PNG or JPEG.</p>
+
+      <label class="file-drop" for="file-input">
+        <span id="file-label">Choose an image…</span>
+      </label>
+      <input id="file-input" type="file" accept="image/png,image/jpeg" hidden />
+
+      <img id="preview" class="preview" alt="preview" hidden />
+
+      <label class="field">
+        <span>Student label (optional)</span>
+        <input id="external-ref" type="text" placeholder="e.g. stu-1" />
+      </label>
+
+      <button id="start-btn" class="primary" disabled>Start session</button>
+
+      <div id="problem-meta" class="problem-meta" hidden>
+        <h3>Extracted problem</h3>
+        <p id="problem-text" class="problem-text"></p>
+        <ul id="concepts" class="concepts"></ul>
+      </div>
+    </section>
+
+    <!-- Chat panel -->
+    <section class="panel chat-panel">
+      <h2>2. Talk it through</h2>
+      <div id="messages" class="messages" aria-live="polite"></div>
+
+      <form id="chat-form" class="chat-input" autocomplete="off">
+        <textarea
+          id="chat-input"
+          rows="1"
+          placeholder="Ask a question — or type &quot;show me the solution&quot; to reveal the answer."
+          disabled
+        ></textarea>
+        <button id="send-btn" type="submit" class="primary" disabled>Send</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

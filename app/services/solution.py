@@ -13,5 +13,5 @@ async def generate_solution(
         p.SOLUTION_SYSTEM,
         p.solution_user(problem_text, concepts, dialogue),
         temperature=0.3,
-        max_tokens=1000,
+        max_tokens=1500,
     )

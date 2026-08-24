@@ -21,6 +21,26 @@ def test_health(client):
     assert r.json() == {"status": "ok"}
 
 
+def test_root_serves_index_html(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "text/html" in r.headers.get("content-type", "")
+    assert "AI Tutor" in r.text
+
+
+def test_static_app_js_served(client):
+    r = client.get("/static/app.js")
+    assert r.status_code == 200
+    assert "javascript" in r.headers.get("content-type", "")
+    assert "startSession" in r.text
+
+
+def test_static_styles_css_served(client):
+    r = client.get("/static/styles.css")
+    assert r.status_code == 200
+    assert "text/css" in r.headers.get("content-type", "")
+
+
 def test_create_session_requires_image(client):
     r = client.post("/api/sessions", files={})
     assert r.status_code == 422
