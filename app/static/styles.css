@@ -251,6 +251,10 @@ button.primary:hover:not(:disabled) { background: #1d4ed8; }
   gap: 8px;
 }
 
+.hint-card.correct {
+  border-left: 3px solid #2c8a3e;
+}
+
 .hint-field {
   display: flex;
   flex-direction: column;
@@ -269,6 +273,19 @@ button.primary:hover:not(:disabled) { background: #1d4ed8; }
   font-size: 14px;
   white-space: pre-wrap;
   word-wrap: break-word;
+}
+
+.hint-source {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted, #888);
+}
+.hint-source a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.hint-source a:hover {
+  text-decoration: underline;
 }
 .chat-input {
   display: flex;

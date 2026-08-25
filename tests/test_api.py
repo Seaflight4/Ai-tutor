@@ -90,3 +90,33 @@ def test_get_session_404_for_unknown(client):
 def test_get_profile_404_for_unknown_student(client, fake_supabase):
     r = client.get(f"/api/students/{uuid4()}/profile")
     assert r.status_code == 404
+
+
+def test_reply_409_for_resolved_session(client, fake_llm, fake_supabase):
+    """A reply to an already-resolved session returns 409, not 500."""
+    from app.services import session as session_service
+
+    fake_llm.ocr_responses = ["A block slides down a frictionless ramp. Find v."]
+    fake_llm.json_responses = [
+        {
+            "problem_text": "A block slides down a frictionless ramp. Find v.",
+            "formulas": [], "concepts": ["energy conservation"],
+            "topic": None, "diagram_description": None,
+        },
+        {"concept": "energy conservation", "mastery_score": 0.2},
+    ]
+    fake_llm.text_responses = [
+        "Opening: where are you stuck?",
+        "Full solution: $mgh = \\tfrac12 mv^2$.",
+    ]
+
+    import asyncio
+
+    session = asyncio.run(
+        session_service.start_session(_png_bytes(), "image/png", None, "stu-409")
+    )
+    sid = session["id"]
+    asyncio.run(session_service.reveal_solution(__import__("uuid").UUID(sid)))
+
+    r = client.post(f"/api/sessions/{sid}/reply", json={"message": "more help"})
+    assert r.status_code == 409

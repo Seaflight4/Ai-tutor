@@ -129,7 +129,7 @@ async function sendReply(message) {
     state.loopCount = reply.loop_index;
 
     if (reply.hint) {
-      addHintBubble(reply.hint, reply.classification);
+      addHintBubble(reply.hint, reply.classification, reply.content);
     } else {
       addBubble("tutor", reply.content);
     }
@@ -183,7 +183,7 @@ function showError(msg) {
 }
 
 // Structured hint card ------------------------------------------------------
-function addHintBubble(hint, classification) {
+function addHintBubble(hint, classification, content) {
   const div = document.createElement("div");
   div.className = "bubble tutor hint-card";
 
@@ -200,14 +200,38 @@ function addHintBubble(hint, classification) {
   } else if (cls === "on_track") {
     if (hint.confirmation) addField(div, "Confirmation", hint.confirmation);
     if (hint.next_step_hint) addField(div, "Next step", hint.next_step_hint);
+  } else if (cls === "answer_check") {
+    const status = hint.answer_status || "partial";
+    const label = status === "correct" ? "Correct"
+                : status === "incorrect" ? "Incorrect"
+                : "Partial";
+    addField(div, label, hint.answer_value ? `Your answer: ${hint.answer_value}` : "");
+    if (hint.method_feedback) addField(div, "Method", hint.method_feedback);
+    if (hint.mistake) addField(div, "Mistake", hint.mistake);
+    if (hint.reason) addField(div, "Reason", hint.reason);
+    if (hint.application_hint) addField(div, "Hint", hint.application_hint);
+    if (status === "correct") div.classList.add("correct");
+  } else if (cls === "incorrect_answer") {
+    if (hint.mistake) addField(div, "Mistake", hint.mistake);
+    if (hint.reason) addField(div, "Reason", hint.reason);
+    if (hint.application_hint) addField(div, "Hint", hint.application_hint);
+  } else if (cls === "solved") {
+    if (hint.confirmation) addField(div, "", hint.confirmation);
+    div.classList.add("correct");
+  } else if (cls === "meta") {
+    if (hint.meta_response) addField(div, "", hint.meta_response);
   } else {
     // unknown — just show the explanation
     if (hint.explanation) addField(div, "", hint.explanation);
   }
 
-  // If nothing was filled, fall back to a plain tutor bubble.
+  // Source citation (when the hint was grounded in a reference chunk).
+  if (hint.source_title) addSource(div, hint.source_title, hint.source_url);
+
+  // If nothing was filled, fall back to a plain tutor bubble using the
+  // backend-supplied `content` (which summarize_hint always makes non-empty).
   if (!div.children.length) {
-    addBubble("tutor", hint.explanation || "");
+    addBubble("tutor", content || hint.explanation || "");
     return;
   }
 
@@ -230,6 +254,27 @@ function addField(parent, label, value) {
   val.textContent = value;
   field.appendChild(val);
   parent.appendChild(field);
+}
+
+function addSource(parent, title, url) {
+  const src = document.createElement("div");
+  src.className = "hint-source";
+  const label = document.createElement("span");
+  label.textContent = "Source: ";
+  src.appendChild(label);
+  if (url) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = title;
+    src.appendChild(a);
+  } else {
+    const t = document.createElement("span");
+    t.textContent = title;
+    src.appendChild(t);
+  }
+  parent.appendChild(src);
 }
 
 function renderMath(el) {

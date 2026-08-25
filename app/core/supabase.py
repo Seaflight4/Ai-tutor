@@ -11,21 +11,18 @@ source of truth in `db/schema.sql`.
 
 from __future__ import annotations
 
-import json
 from typing import Any, cast
 from uuid import UUID
 
 from app.core import local_store
 from app.core.config import get_settings
-
-_settings = get_settings()
-_USE_LOCAL = not _settings.supabase_url
+from app.ports.repositories import NotFoundError
 
 _client: Any = None
 
 
 def _is_local() -> bool:
-    return _USE_LOCAL
+    return not get_settings().supabase_url
 
 
 def get_client() -> Any:
@@ -36,11 +33,14 @@ def get_client() -> Any:
     if _client is None:
         from supabase import create_client
 
-        _client = create_client(_settings.supabase_url, _settings.supabase_key)
+        settings = get_settings()
+        _client = create_client(settings.supabase_url, settings.supabase_key)
     return _client
 
 
 def _first(data: Any) -> dict[str, Any]:
+    if not data:
+        raise IndexError("expected at least one row, got none")
     return cast(dict[str, Any], data[0])
 
 
@@ -92,7 +92,7 @@ def get_student(student_id: UUID) -> dict[str, Any]:
     )
     row = _maybe_single_data(res)
     if row is None:
-        raise KeyError(f"student {student_id} not found")
+        raise NotFoundError(f"student {student_id} not found")
     return row
 
 
@@ -107,6 +107,7 @@ def create_session(
     problem_image_url: str | None,
     concepts: list[str],
     ocr_raw: dict[str, Any],
+    problem_type: str | None = None,
 ) -> dict[str, Any]:
     if _is_local():
         return local_store.create_session(
@@ -116,6 +117,7 @@ def create_session(
             problem_image_url=problem_image_url,
             concepts=concepts,
             ocr_raw=ocr_raw,
+            problem_type=problem_type,
         )
     payload = {
         "student_id": str(student_id),
@@ -123,7 +125,8 @@ def create_session(
         "problem_text": problem_text,
         "problem_image_url": problem_image_url,
         "concepts": concepts,
-        "ocr_raw": json.loads(json.dumps(ocr_raw)),  # jsonb-safe
+        "problem_type": problem_type,
+        "ocr_raw": ocr_raw,
     }
     res = get_client().table("sessions").insert(payload).execute()
     return _first(res.data)
@@ -142,7 +145,7 @@ def get_session(session_id: UUID) -> dict[str, Any]:
     )
     row = _maybe_single_data(res)
     if row is None:
-        raise KeyError(f"session {session_id} not found")
+        raise NotFoundError(f"session {session_id} not found")
     return row
 
 
@@ -150,6 +153,7 @@ def update_session(
     session_id: UUID,
     *,
     loop_count: int | None = None,
+    status: str | None = None,
     resolved: bool | None = None,
     resolution_type: str | None = None,
 ) -> dict[str, Any]:
@@ -157,12 +161,15 @@ def update_session(
         return local_store.update_session(
             session_id,
             loop_count=loop_count,
+            status=status,
             resolved=resolved,
             resolution_type=resolution_type,
         )
     payload: dict[str, Any] = {}
     if loop_count is not None:
         payload["loop_count"] = loop_count
+    if status is not None:
+        payload["status"] = status
     if resolved is not None:
         payload["resolved"] = resolved
     if resolution_type is not None:
@@ -176,6 +183,8 @@ def update_session(
         .eq("id", str(session_id))
         .execute()
     )
+    if not res.data:
+        raise NotFoundError(f"session {session_id} not found")
     return _first(res.data)
 
 
@@ -209,7 +218,7 @@ def add_turn(
         "loop_index": loop_index,
         "hint_level": hint_level,
         "classification": classification,
-        "metadata": json.loads(json.dumps(metadata or {})),
+        "metadata": metadata or {},
     }
     res = get_client().table("turns").insert(payload).execute()
     return _first(res.data)
@@ -238,7 +247,6 @@ def upsert_profile(
     concept: str,
     mastery_score: float,
     last_session_id: UUID | None = None,
-    embedding: list[float] | None = None,
 ) -> dict[str, Any]:
     if _is_local():
         return local_store.upsert_profile(
@@ -246,7 +254,6 @@ def upsert_profile(
             concept=concept,
             mastery_score=mastery_score,
             last_session_id=last_session_id,
-            embedding=embedding,
         )
     payload: dict[str, Any] = {
         "student_id": str(student_id),
@@ -254,8 +261,21 @@ def upsert_profile(
         "mastery_score": mastery_score,
         "last_session_id": str(last_session_id) if last_session_id else None,
     }
-    if embedding is not None:
-        payload["embedding"] = embedding
+    # Read existing attempts so the upsert increments rather than resetting to
+    # the DB default of 0 (mirrors the local_store read-then-write). Without
+    # this, every upsert on an existing (student_id, concept) would reset the
+    # attempt counter.
+    existing = (
+        get_client()
+        .table("knowledge_profiles")
+        .select("attempts")
+        .eq("student_id", str(student_id))
+        .eq("concept", concept)
+        .maybe_single()
+        .execute()
+    )
+    existing_row = _maybe_single_data(existing)
+    payload["attempts"] = (existing_row or {}).get("attempts", 0) + 1
     res = (
         get_client()
         .table("knowledge_profiles")
@@ -276,6 +296,178 @@ def get_profiles(student_id: UUID) -> list[dict[str, Any]]:
         .execute()
     )
     return cast(list[dict[str, Any]], res.data)
+
+
+# ---------------------------------------------------------------------------
+# session_summaries  (compressed learning record for cross-session reference)
+# ---------------------------------------------------------------------------
+def add_session_summary(
+    student_id: UUID,
+    session_id: UUID,
+    *,
+    problem_text: str,
+    concepts: list[str],
+    problem_type: str | None,
+    outcome: str,
+    target_concept: str | None,
+    summary: str,
+    key_mistakes: str | None = None,
+    mastery_after: float | None = None,
+) -> dict[str, Any]:
+    if _is_local():
+        return local_store.add_session_summary(
+            student_id,
+            session_id,
+            problem_text=problem_text,
+            concepts=concepts,
+            problem_type=problem_type,
+            outcome=outcome,
+            target_concept=target_concept,
+            summary=summary,
+            key_mistakes=key_mistakes,
+            mastery_after=mastery_after,
+        )
+    payload = {
+        "student_id": str(student_id),
+        "session_id": str(session_id),
+        "problem_text": problem_text,
+        "concepts": concepts,
+        "problem_type": problem_type,
+        "outcome": outcome,
+        "target_concept": target_concept,
+        "summary": summary,
+        "key_mistakes": key_mistakes,
+        "mastery_after": mastery_after,
+    }
+    res = (
+        get_client()
+        .table("session_summaries")
+        .upsert(payload, on_conflict="session_id")
+        .execute()
+    )
+    return _first(res.data)
+
+
+def list_session_summaries(student_id: UUID, limit: int = 5) -> list[dict[str, Any]]:
+    if _is_local():
+        return local_store.list_session_summaries(student_id, limit)
+    res = (
+        get_client()
+        .table("session_summaries")
+        .select("*")
+        .eq("student_id", str(student_id))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return cast(list[dict[str, Any]], res.data)
+
+
+def find_related_summaries(
+    student_id: UUID,
+    concepts: list[str],
+    problem_type: str | None = None,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    if _is_local():
+        return local_store.find_related_summaries(student_id, concepts, problem_type, limit)
+    # Supabase: fetch recent summaries and filter in Python (concept overlap
+    # with array containment is possible via PostgREST but doing it in Python
+    # keeps the local and remote paths identical).
+    all_summaries = list_session_summaries(student_id, limit=50)
+    if not all_summaries or not concepts:
+        return []
+    concept_set = set(concepts)
+    related: list[dict[str, Any]] = []
+    for s in all_summaries:
+        s_concepts = set(s.get("concepts", []))
+        if not (concept_set & s_concepts):
+            continue
+        s["_type_match"] = bool(
+            problem_type
+            and s.get("problem_type")
+            and problem_type == s["problem_type"]
+        )
+        related.append(s)
+    related.sort(key=lambda x: (x["_type_match"], x.get("created_at", "")), reverse=True)
+    for x in related:
+        x.pop("_type_match", None)
+    return related[:limit]
+
+
+# ---------------------------------------------------------------------------
+# reference_chunks  (curated physics reference corpus for source grounding)
+# ---------------------------------------------------------------------------
+def add_reference_chunk(
+    *,
+    source_id: str,
+    source_title: str,
+    source_url: str,
+    chapter: str | None,
+    heading: str | None,
+    chunk_text: str,
+    concepts: list[str],
+) -> dict[str, Any]:
+    """Insert a reference chunk. Used by the ingest script, not at request time."""
+    if _is_local():
+        return local_store.add_reference_chunk(
+            source_id=source_id,
+            source_title=source_title,
+            source_url=source_url,
+            chapter=chapter,
+            heading=heading,
+            chunk_text=chunk_text,
+            concepts=concepts,
+        )
+    payload: dict[str, Any] = {
+        "source_id": source_id,
+        "source_title": source_title,
+        "source_url": source_url,
+        "chapter": chapter,
+        "heading": heading,
+        "chunk_text": chunk_text,
+        "concepts": concepts,
+    }
+    res = get_client().table("reference_chunks").insert(payload).execute()
+    return _first(res.data)
+
+
+def list_reference_chunks_by_concepts(concepts: list[str]) -> list[dict[str, Any]]:
+    """Return reference chunks tagged with at least one of the given concepts.
+
+    Fetches metadata + chunk_text; the retrieval service re-ranks by keyword
+    overlap (no vector search).
+    """
+    if _is_local():
+        return local_store.list_reference_chunks_by_concepts(concepts)
+    query = get_client().table("reference_chunks").select(
+        "id,source_id,source_title,source_url,chapter,heading,chunk_text,concepts"
+    )
+    if concepts:
+        # Reject concepts containing PostgREST filter metacharacters that
+        # would break the `or_`/`cs` syntax or allow filter injection. Spaces
+        # and word characters are safe inside the `{...}` array literal.
+        # Concepts come from the LLM (ocr.py) so this is a real attack surface.
+        unsafe = set(",.()")
+        safe = [c for c in concepts if c and not any(ch in c for ch in unsafe)]
+        if safe:
+            query = query.or_(",".join(f"concepts.cs.{{{c}}}" for c in safe))
+    res = query.execute()
+    return cast(list[dict[str, Any]], res.data)
+
+
+def reset_reference_chunks() -> None:
+    """Clear all reference chunks. Used by tests and corpus re-ingestion.
+
+    On the local backend this deletes from the SQLite table; on Supabase it
+    issues a delete against the `reference_chunks` table so both backends
+    behave identically (previously this was a silent no-op on Supabase, which
+    let stale chunks leak between test runs and re-ingestions).
+    """
+    if _is_local():
+        local_store.reset_reference_chunks()
+        return
+    get_client().table("reference_chunks").delete().neq("id", "00000000").execute()
 
 
 def reset_client() -> None:

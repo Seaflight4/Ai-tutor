@@ -5,10 +5,13 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from PIL import Image
 
+from app.api.auth import require_api_key
 from app.core import supabase
+from app.core.config import get_settings
+from app.domain.state import SessionTerminalError
 from app.models.schemas import (
     ProfileEntry,
     ProfileOut,
@@ -18,9 +21,10 @@ from app.models.schemas import (
     TurnOut,
     TutorReply,
 )
+from app.ports.repositories import NotFoundError
 from app.services import session as session_service
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 
 _ACCEPTED_IMAGE_TYPES = {"image/png", "image/jpeg"}
 
@@ -30,6 +34,9 @@ def _normalize_image(upload: UploadFile) -> tuple[bytes, str]:
     if content_type not in _ACCEPTED_IMAGE_TYPES:
         raise HTTPException(415, f"unsupported image type: {content_type}")
     raw = upload.file.read()
+    max_bytes = get_settings().max_image_bytes
+    if len(raw) > max_bytes:
+        raise HTTPException(413, f"image exceeds {max_bytes} bytes")
     # Convert JPEG -> PNG bytes so the OCR model receives a stable format.
     if content_type == "image/jpeg":
         import io
@@ -59,9 +66,14 @@ async def create_session(
 @router.post("/sessions/{session_id}/reply", response_model=TutorReply)
 async def reply(session_id: UUID, body: ReplyIn) -> TutorReply:
     """Student replies; tutor responds with the next hint or a reveal offer."""
+    max_chars = get_settings().max_reply_chars
+    if len(body.message) > max_chars:
+        raise HTTPException(413, f"reply exceeds {max_chars} characters")
     try:
         return await session_service.reply(session_id, body.message)
-    except KeyError as exc:
+    except SessionTerminalError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (KeyError, NotFoundError) as exc:
         raise HTTPException(404, "session not found") from exc
 
 
@@ -70,7 +82,7 @@ async def reveal(session_id: UUID) -> RevealOut:
     """Force-reveal the full solution."""
     try:
         out = await session_service.reveal_solution(session_id)
-    except KeyError as exc:
+    except (KeyError, NotFoundError) as exc:
         raise HTTPException(404, "session not found") from exc
     return RevealOut(**out)
 
@@ -80,7 +92,7 @@ async def get_session(session_id: UUID) -> dict[str, Any]:
     """Return the session metadata and full transcript."""
     try:
         session = supabase.get_session(session_id)
-    except KeyError as exc:
+    except (KeyError, NotFoundError) as exc:
         raise HTTPException(404, "session not found") from exc
     turns = supabase.list_turns(session_id)
     return {
@@ -93,7 +105,7 @@ async def get_session(session_id: UUID) -> dict[str, Any]:
 async def get_profile(student_id: UUID) -> ProfileOut:
     try:
         student = supabase.get_student(student_id)
-    except KeyError as exc:
+    except (KeyError, NotFoundError) as exc:
         raise HTTPException(404, "student not found") from exc
     profiles = supabase.get_profiles(student_id)
     return ProfileOut(
@@ -124,6 +136,7 @@ def _to_session_out(row: dict[str, Any]) -> SessionOut:
         problem_image_url=row.get("problem_image_url"),
         concepts=row.get("concepts") or [],
         loop_count=row["loop_count"],
+        status=row.get("status") or "active",
         resolved=row["resolved"],
         resolution_type=row.get("resolution_type"),
         created_at=row["created_at"],

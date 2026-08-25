@@ -15,27 +15,44 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 from typing import Any, cast
 
 from openai import AsyncOpenAI
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 
-_settings = get_settings()
+logger = logging.getLogger(__name__)
 
-# A single async client is safe to reuse across requests.
+# A single async client is safe to reuse across requests. Built on first use
+# from the current settings; `reset_client()` drops it (used by tests and when
+# config changes at runtime).
 _client: AsyncOpenAI | None = None
+_client_settings: Settings | None = None
 
 
 def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
+    global _client, _client_settings
+    settings = get_settings()
+    if _client is None or _client_settings is not settings:
+        if not settings.skainet_api_key:
+            raise RuntimeError(
+                "SKAINET_API_KEY is not configured. Set it in .env or the environment."
+            )
         _client = AsyncOpenAI(
-            base_url=_settings.skainet_base_url,
-            api_key=_settings.skainet_api_key or "missing",
+            base_url=settings.skainet_base_url,
+            api_key=settings.skainet_api_key,
         )
+        _client_settings = settings
     return _client
+
+
+def reset_client() -> None:
+    """Drop the cached client (used by tests and when config changes)."""
+    global _client, _client_settings
+    _client = None
+    _client_settings = None
 
 
 def _image_to_data_url(image_bytes: bytes, mime: str = "image/png") -> str:
@@ -57,8 +74,9 @@ async def chat_json(
     strip ``` fences if present before parsing.
     """
     client = _get_client()
+    settings = get_settings()
     resp = await client.chat.completions.create(
-        model=model or _settings.model_chat,
+        model=model or settings.model_chat,
         temperature=temperature,
         max_tokens=max_tokens,
         messages=[
@@ -67,7 +85,7 @@ async def chat_json(
         ],
     )
     text = resp.choices[0].message.content or "{}"
-    return _parse_json(_strip_cot(text))
+    return _parse_json(_strip_think_only(text))
 
 
 async def chat_text(
@@ -85,8 +103,9 @@ async def chat_text(
     that marker. If no marker is present, the text is returned unchanged.
     """
     client = _get_client()
+    settings = get_settings()
     resp = await client.chat.completions.create(
-        model=model or _settings.model_chat,
+        model=model or settings.model_chat,
         temperature=temperature,
         max_tokens=max_tokens,
         messages=[
@@ -107,9 +126,10 @@ async def ocr_image(
 ) -> str:
     """Send an image to the OCR model and return extracted text."""
     client = _get_client()
+    settings = get_settings()
     data_url = _image_to_data_url(image_bytes, mime)
     resp = await client.chat.completions.create(
-        model=_settings.model_ocr,
+        model=settings.model_ocr,
         temperature=0.0,
         max_tokens=max_tokens,
         messages=[
@@ -125,28 +145,11 @@ async def ocr_image(
     return (resp.choices[0].message.content or "").strip()
 
 
-async def embed(text: str) -> list[float]:
-    """Embed text for pgvector personalization.
-
-    Falls back to a zero vector if the gateway has no embeddings endpoint, so
-    the rest of the pipeline degrades gracefully (no personalization) rather
-    than crashing.
-    """
-    client = _get_client()
-    try:
-        resp = await client.embeddings.create(
-            model="text-embedding-3-small", input=text
-        )
-        return resp.data[0].embedding
-    except Exception:
-        return [0.0] * 1536
-
-
 # ---------------------------------------------------------------------------
 # Chain-of-thought stripping
 # ---------------------------------------------------------------------------
 # GLM-5.2 emits reasoning before the answer in several shapes:
-#   1. An explicit reasoning tag:  <think>...reasoning...</think>  (primary)
+#   1. An explicit reasoning tag:    (primary)
 #   2. A fenced block:  ```\n<reasoning>\n```\n<answer>  (or ```markdown / ```json)
 #   3. A quote-delimited block ending with "\u201d\n"
 # We remove ALL <think>...</think> blocks, then fall back to fence/quote
@@ -164,10 +167,23 @@ _FENCE = re.compile(r"```")
 _ANSWER_MARKER = re.compile(re.escape("\u201d\n"))
 
 
+def _strip_think_only(text: str) -> str:
+    """Remove ilda...think blocks only, leaving fences and quotes intact.
+
+    Used by `chat_json`: the JSON payload may itself be wrapped in ``` fences,
+    which `_strip_cot` would discard (it assumes the answer follows the
+    closing fence). `_parse_json` already handles fences correctly, so for
+    JSON calls we only need the think-block removal.
+    """
+    if not text:
+        return text
+    return _THINK_BLOCK.sub("", text).strip()
+
+
 def _strip_cot(text: str) -> str:
     """Remove leaked chain-of-thought from a chat completion.
 
-    1. Drop all <think>...</think> blocks (GLM-5.2's primary format).
+    1. Drop all ilda...think blocks (GLM-5.2's primary format).
     2. If the result still starts with a fenced reasoning block, keep text
        after the last ``` fence.
     3. Else fall back to the GLM quote-marker.
@@ -200,7 +216,7 @@ def _parse_json(text: str) -> dict[str, Any]:
     """
     cleaned = text.strip()
 
-    # 0. Strip any ilda reasoning blocks first (belt-and-suspenders; _strip_cot
+    # 0. Strip any <think> reasoning blocks first (belt-and-suspenders; _strip_cot
     #    already did this for chat_json, but be safe for direct callers).
     cleaned = _THINK_BLOCK.sub("", cleaned).strip()
 
@@ -213,7 +229,9 @@ def _parse_json(text: str) -> dict[str, Any]:
         inner = cleaned[open_idx:close_idx]
         # Strip the opening fence and an optional language tag like "json".
         inner = inner.split("```", 1)[1]
-        if inner[:4].lower() in {"json", "```"}:
+        if inner[:3] == "```":
+            inner = inner[3:]
+        elif inner[:4].lower() == "json":
             inner = inner[4:]
         cleaned = inner.strip()
     # 2. No fence: keep as-is (may still be plain JSON or reasoning+JSON).
